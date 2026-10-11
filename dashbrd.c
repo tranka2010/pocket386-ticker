@@ -3,10 +3,22 @@
 #include <string.h>
 #include <dos.h>
 #include <conio.h>
-#include "screen_fixed.h"
+#include "screen.h"
 
 #define COM1_BASE 0x3F8
 #define BIOS_TICKS_PER_DAY 0x1800B0UL
+
+/* Edit these four settings before building the ESP-AT transport. */
+#define ESP_WIFI_SSID     "YOUR_WIFI_NAME"
+#define ESP_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define ESP_HOST_IP       "192.168.1.100"
+#define ESP_HOST_PORT     8765
+
+#define TRANSPORT_SERIAL 0
+#define TRANSPORT_ESP_AT 1
+
+static int g_transport = TRANSPORT_SERIAL;
+static int g_esp_transparent_active = 0;
 
 static unsigned long get_dos_ticks(void)
 {
@@ -83,13 +95,141 @@ static int serial_read_line(char *buffer, int max_len, unsigned int timeout_sec)
     return overflow ? -1 : 1;
 }
 
+static void clear_serial_rx(void)
+{
+    while (inportb(COM1_BASE + 5) & 0x01) (void)inportb(COM1_BASE);
+}
+
+static int wait_for_at_ok(unsigned int timeout_sec)
+{
+    char line[128];
+    unsigned long start;
+    int rc;
+    start = get_dos_ticks();
+    while (elapsed_ticks(start, get_dos_ticks()) < (unsigned long)timeout_sec * 18UL) {
+        rc = serial_read_line(line, sizeof(line), 1);
+        if (rc <= 0) continue;
+        if (strcmp(line, "OK") == 0) return 1;
+        if (strstr(line, "ERROR") != NULL || strstr(line, "FAIL") != NULL) return 0;
+    }
+    return 0;
+}
+
+static int try_at_baud(unsigned int baud)
+{
+    if (!init_serial(baud)) return 0;
+    delay(150);
+    clear_serial_rx();
+    if (!send_serial_str("AT\r\n")) return 0;
+    if (!wait_for_at_ok(3)) return 0;
+    return 1;
+}
+
+static int send_at_command(const char *command, unsigned int timeout_sec)
+{
+    if (!send_serial_str(command) || !send_serial_str("\r\n")) return 0;
+    return wait_for_at_ok(timeout_sec);
+}
+
+/* AT+CIPSEND returns a '>' prompt without requiring a newline. */
+static int wait_for_at_prompt(unsigned int timeout_sec)
+{
+    char line[96];
+    int idx;
+    unsigned long start;
+    idx = 0;
+    line[0] = '\0';
+    start = get_dos_ticks();
+    while (elapsed_ticks(start, get_dos_ticks()) < (unsigned long)timeout_sec * 18UL) {
+        unsigned char ch;
+        if ((inportb(COM1_BASE + 5) & 0x01) == 0) continue;
+        ch = (unsigned char)inportb(COM1_BASE);
+        if (ch == '>') return 1;
+        if (ch == '\r') continue;
+        if (ch == '\n') {
+            line[idx] = '\0';
+            if (strstr(line, "ERROR") != NULL || strstr(line, "FAIL") != NULL) return 0;
+            idx = 0;
+            line[0] = '\0';
+        } else if (idx < (int)sizeof(line) - 1) {
+            line[idx++] = (char)ch;
+        }
+    }
+    return 0;
+}
+
+static int initialize_esp_at_transport(void)
+{
+    char command[160];
+    print_str(1, 23, "[ESP-AT] Detecting UART speed...", MAKE_ATTR(BLACK, YELLOW));
+    if (!try_at_baud(115200U) && !try_at_baud(9600U)) {
+        print_str(1, 23, "[ESP-AT] No AT response at 115200/9600", MAKE_ATTR(BLACK, LIGHTRED));
+        return 0;
+    }
+
+    print_str(1, 23, "[ESP-AT] Configuring Wi-Fi...", MAKE_ATTR(BLACK, YELLOW));
+    if (!send_at_command("ATE0", 4)) {
+        print_str(1, 23, "[ESP-AT] ATE0 failed", MAKE_ATTR(BLACK, LIGHTRED));
+        return 0;
+    }
+    if (!send_at_command("AT+CWMODE=1", 5)) {
+        print_str(1, 23, "[ESP-AT] CWMODE failed", MAKE_ATTR(BLACK, LIGHTRED));
+        return 0;
+    }
+    sprintf(command, "AT+CWJAP=\"%s\",\"%s\"", ESP_WIFI_SSID, ESP_WIFI_PASSWORD);
+    if (!send_at_command(command, 60)) {
+        print_str(1, 23, "[ESP-AT] Wi-Fi join failed; check SSID/password", MAKE_ATTR(BLACK, LIGHTRED));
+        return 0;
+    }
+    if (!send_at_command("AT+CIPMUX=0", 5)) {
+        print_str(1, 23, "[ESP-AT] CIPMUX failed", MAKE_ATTR(BLACK, LIGHTRED));
+        return 0;
+    }
+
+    print_str(1, 23, "[ESP-AT] Connecting to Linux host...", MAKE_ATTR(BLACK, YELLOW));
+    sprintf(command, "AT+CIPSTART=\"TCP\",\"%s\",%u", ESP_HOST_IP, ESP_HOST_PORT);
+    if (!send_at_command(command, 30)) {
+        print_str(1, 23, "[ESP-AT] TCP connect failed; check host/IP/firewall", MAKE_ATTR(BLACK, LIGHTRED));
+        return 0;
+    }
+    if (!send_at_command("AT+CIPMODE=1", 5)) {
+        print_str(1, 23, "[ESP-AT] Transparent mode failed", MAKE_ATTR(BLACK, LIGHTRED));
+        return 0;
+    }
+    if (!send_serial_str("AT+CIPSEND\r\n") || !wait_for_at_prompt(8)) {
+        print_str(1, 23, "[ESP-AT] CIPSEND prompt failed", MAKE_ATTR(BLACK, LIGHTRED));
+        return 0;
+    }
+    /* The prompt is not dashboard data; clear any trailing prompt whitespace. */
+    delay(100);
+    clear_serial_rx();
+    g_esp_transparent_active = 1;
+    return 1;
+}
+
+static void close_esp_at_transport(void)
+{
+    if (!g_esp_transparent_active) return;
+    /* ESP-AT requires a one-second guard period around the +++ escape. */
+    delay(1100);
+    (void)send_serial_str("+++");
+    delay(1100);
+    clear_serial_rx();
+    (void)send_at_command("AT+CIPMODE=0", 5);
+    (void)send_at_command("AT+CIPCLOSE", 5);
+    g_esp_transparent_active = 0;
+}
+
 static void draw_dashboard_layout(void)
 {
     unsigned char border, header;
     border = MAKE_ATTR(BLACK, CYAN);
     header = MAKE_ATTR(BLACK, YELLOW);
     clear_screen(MAKE_ATTR(BLACK, LIGHTGRAY));
-    print_str(2, 0, "POCKET386 MS-DOS DASHBOARD", MAKE_ATTR(BLUE, WHITE));
+    if (g_transport == TRANSPORT_ESP_AT)
+        print_str(2, 0, "POCKET386 MS-DOS DASHBOARD [ESP-AT]", MAKE_ATTR(BLUE, WHITE));
+    else
+        print_str(2, 0, "POCKET386 MS-DOS DASHBOARD [SERIAL]", MAKE_ATTR(BLUE, WHITE));
     draw_box(0,  1, 39, 8,  "1. WEATHER (Waltham, MA)", border, header);
     draw_box(40, 1, 79, 8,  "2. STOCKS & INDEXES", border, header);
     draw_box(0,  8, 39, 22, "3. HEADLINES (NPR / RSS)", border, header);
@@ -274,16 +414,36 @@ static int fetch_data_from_proxy(void)
     return 1;
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
     unsigned long last_ticks, current_ticks;
     unsigned long refresh_interval_ticks;
+    int i;
+
     refresh_interval_ticks = 273UL; /* Approximately 15 seconds at 18.2 Hz. */
-    if (!init_serial(9600)) {
+    g_transport = TRANSPORT_SERIAL; /* Backward-compatible default. */
+    for (i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "/ESP") == 0 || strcmp(argv[i], "-ESP") == 0)
+            g_transport = TRANSPORT_ESP_AT;
+        else if (strcmp(argv[i], "/SERIAL") == 0 || strcmp(argv[i], "-SERIAL") == 0)
+            g_transport = TRANSPORT_SERIAL;
+        else {
+            printf("Usage: DASHBRD [/SERIAL|/ESP]\n");
+            return 1;
+        }
+    }
+
+    if (g_transport == TRANSPORT_SERIAL && !init_serial(9600)) {
         printf("Invalid serial baud rate.\n");
         return 1;
     }
     draw_dashboard_layout();
+    if (g_transport == TRANSPORT_ESP_AT && !initialize_esp_at_transport()) {
+        print_str(1, 24, "Check ESP-AT firmware, Wi-Fi settings, and host IP in source.",
+                  MAKE_ATTR(BLACK, LIGHTRED));
+        return 1;
+    }
+
     fetch_data_from_proxy();
     last_ticks = get_dos_ticks();
     while (1) {
@@ -306,6 +466,7 @@ int main(void)
         }
         delay(100);
     }
+    close_esp_at_transport();
     clear_screen(MAKE_ATTR(BLACK, LIGHTGRAY));
     gotoxy(1, 1);
     printf("Pocket386 Dashboard closed.\n");

@@ -29,6 +29,7 @@ WEATHER_INTERVAL = 600
 STOCKS_INTERVAL = 60
 HEADLINES_INTERVAL = 300
 SPORTS_INTERVAL = 30
+TCP_CLIENT_IDLE_TIMEOUT = 180  # Keep ESP-AT transparent TCP sessions alive between refreshes.
 
 WEATHER_POINT_URL = "https://api.weather.gov/points/42.3765,-71.2356"
 # Replace this with a real contact address before deployment; NWS requests
@@ -163,6 +164,30 @@ def fetch_headlines():
     return "@HL|" + "|".join(headlines[:6])
 
 
+def format_game_status(league_code, status):
+    """Return a compact live status that includes the period and game clock."""
+    status = status or {}
+    status_type = status.get("type", {}) or {}
+    if status_type.get("state") == "in":
+        period = status.get("period")
+        clock = sanitize_ascii(status.get("displayClock", ""), 5)
+        try:
+            period = int(period)
+        except (TypeError, ValueError):
+            period = 0
+
+        if league_code == "nhl":
+            prefix = f"P{period}" if 1 <= period <= 3 else "OT"
+        else:  # NBA and NFL scoreboard periods are quarters; period 5+ is overtime.
+            prefix = f"Q{period}" if 1 <= period <= 4 else "OT"
+        if clock:
+            return f"{prefix} {clock}"[:8]
+        return f"{prefix} LIVE"[:8]
+
+    detail = status_type.get("shortDetail") or status_type.get("description") or "Status?"
+    return sanitize_ascii(detail, 8)
+
+
 def fetch_sports():
     boston_games, other_games = [], []
     headers = {"User-Agent": "Pocket386Dashboard/1.0"}
@@ -184,7 +209,7 @@ def fetch_sports():
                 team1, team2 = t1.get("team", {}), t2.get("team", {})
                 a1, a2 = sanitize_ascii(team1.get("abbreviation", "?"), 4), sanitize_ascii(team2.get("abbreviation", "?"), 4)
                 n1, n2 = team1.get("displayName", ""), team2.get("displayName", "")
-                status = comp.get("status", {}).get("type", {}).get("shortDetail", "Status?")
+                status = format_game_status(league_code, comp.get("status", {}))
                 entry = [label, a1, sanitize_ascii(t1.get("score", "--"), 4), a2,
                          sanitize_ascii(t2.get("score", "--"), 4), sanitize_ascii(status, 8)]
                 names = (n1 + " " + n2).lower()
@@ -274,7 +299,10 @@ def serve_serial_forever():
 class DashboardTCPHandler(socketserver.StreamRequestHandler):
     """Simple line-oriented TCP transport for a custom ESP-01 serial bridge."""
     def handle(self):
-        self.request.settimeout(10)
+        # ESP-AT transparent mode keeps one TCP connection open across refreshes.
+        # The DOS client refreshes about every 15 seconds, so don't close the
+        # connection during normal idle time between GET requests.
+        self.request.settimeout(TCP_CLIENT_IDLE_TIMEOUT)
         try:
             while True:
                 raw = self.rfile.readline(32)
