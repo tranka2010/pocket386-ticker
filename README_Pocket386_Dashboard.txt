@@ -1,89 +1,84 @@
-POCKET386 DASHBOARD - FEATURE-COMPLETE SOURCE REVISION
-====================================================
+POCKET386 DASHBOARD - DUAL TRANSPORT REVISION
+=============================================
 
 FILES
 -----
-dos_serial_proxy_fixed.py  Python data service; serves serial and TCP requests
-dashbrd_fixed.c             Borland C / DOS client
-screen_fixed.h              VGA text-mode helpers
+dos_serial_proxy_fixed.py  Linux Python data service; serial and TCP endpoints
+dashbrd_fixed.c             Borland C / DOS dashboard client
+screen_fixed.h       VGA text-mode helpers
 
-ARCHITECTURE
+WHAT CHANGED
 ------------
-The Linux process refreshes weather, stocks, headlines, and sports in four
-independent background threads. The serial and TCP handlers return a snapshot
-of the most recently refreshed records; they do not wait for upstream HTTP
-requests. The line protocol remains ASCII and pipe-delimited, ending with @END.
+- The DOS client supports both the original direct serial transport and an
+  ESP-01S running compatible factory ESP-AT firmware.
+- Transport is selected on the DOS command line. The default remains direct
+  serial, preserving the previous behavior:
+      DASHBRD /SERIAL
+      DASHBRD /ESP
+- ESP-AT mode detects a module UART speed of either 115200 or 9600 baud,
+  configures Wi-Fi, opens one TCP connection to the Linux host, and enters
+  transparent UART-to-TCP mode. The DOS client then uses the same GET / @END
+  protocol as direct serial.
+- On normal exit, ESP-AT mode attempts to leave transparent mode and close the
+  TCP connection so a later launch can initialize the module again.
+- The Python TCP handler accepts repeated GET requests on the same connection
+  and allows up to 180 seconds idle time, so the ESP-AT transparent connection
+  survives the dashboard's approximately 15-second refresh interval.
+- Live NBA/NFL status now includes the quarter, for example "Q2 05:32". Live NHL
+  status includes the period, for example "P2 08:11". Overtime displays "OT"
+  with the clock. Pregame/final status remains provider-supplied short detail.
 
-The header includes host UTC time and the age in minutes of each source's most
-recent refresh attempt (W=weather, S=stocks, H=headlines, P=sports). This age
-indicates when the source was last checked; it does not guarantee the provider's
-underlying data is current. Provider failures are logged and displayed as
-unavailable rather than being replaced with fabricated live-looking values.
+ESP-AT CONFIGURATION
+--------------------
+Before compiling dashbrd_fixed.c for ESP mode, edit these definitions near the top:
+  ESP_WIFI_SSID
+  ESP_WIFI_PASSWORD
+  ESP_HOST_IP       (numeric LAN IPv4 address of the Linux computer)
+  ESP_HOST_PORT     (8765 unless you changed the Python service)
 
-CONFIGURATION
--------------
-Edit the configuration constants near the top of dos_serial_proxy_fixed.py:
-  SERIAL_PORT = "/dev/ttyUSB0"
-  BAUD_RATE = 9600
-  TCP_BIND_HOST = "0.0.0.0"
-  TCP_PORT = 8765
+Use a simple SSID/password that do not contain literal double quotes. The
+ESP module must be running ESP8266 AT firmware that supports AT+CWMODE,
+AT+CWJAP, AT+CIPMUX, AT+CIPSTART, AT+CIPMODE, and transparent AT+CIPSEND.
+The client probes 115200 and 9600 baud. If your module uses another baud rate,
+change the probe list in try_at_baud() or configure the module to one of these
+speeds before use.
 
-Replace the example contact address in WEATHER_HEADERS with a real contact
-address before deployment. The Linux host clock should be synchronized with
-NTP or an equivalent time service.
+The ESP's UART and the Pocket386 COM1 must use compatible 3.3 V signaling at
+the ESP side, with proper power and common ground. The ESP-01S needs a stable
+3.3 V supply able to handle Wi-Fi current bursts. Do not connect 5 V directly
+to ESP VCC or ESP RX.
 
-Install dependencies on Linux:
+PYTHON HOST SETUP
+-----------------
+Edit SERIAL_PORT and BAUD_RATE if required. The service refreshes weather,
+stocks, headlines, and sports in independent background workers. It serves
+both the original serial interface and TCP port 8765 at the same time. If the
+ESP-AT connection is used, allow TCP port 8765 only from your trusted LAN in
+the Linux firewall; the endpoint has no application authentication or TLS.
+
+Install dependencies:
   python3 -m pip install requests pyserial
 
 Run:
   python3 dos_serial_proxy_fixed.py
 
-The service continues to provide the existing serial interface while also
-listening for TCP clients on port 8765. Because the TCP listener has no
-application-level authentication or TLS, allow that port only from the trusted
-local network using the Linux firewall. Do not forward it from the Internet.
+Replace the example contact address in WEATHER_HEADERS with a real contact
+address before deployment. Keep the Linux host clock synchronized.
 
 DOS BUILD / TEST
 ----------------
-Compile dashbrd_fixed.c with the intended Borland C compiler and keep
-screen_fixed.h in the same directory (the revised client includes that filename).
+Compile dashbrd_fixed.c with Borland C and keep screen_fixed.h in the same directory.
 The source has not been compiled with Borland C or tested on Pocket386 hardware
-in this environment. Keep the prior executable and source files until hardware
-tests pass. Confirm that the system starts in 80x25 color text mode and that
-COM1 is the intended UART at 9600 baud, 8N1.
+in this environment. It has been checked with a host C89 syntax test using DOS
+API stubs. Test direct serial mode first, then ESP mode. Keep the prior working
+executable and sources until hardware tests pass. The screen expects 80x25
+color text mode and COM1 at 9600 baud for direct serial mode.
 
-ESP-01 OPTION (ASSESSMENT)
--------------------------
-Recommended design: custom ESP8266 firmware acts as a small serial-to-TCP
-bridge. The Pocket386 still sends GET<CR/LF> and receives the same newline-
-terminated dashboard records. On GET, the ESP joins the configured Wi-Fi,
-connects to the Linux host's TCP port 8765, sends GET followed by newline,
-forwards bytes until @END, then closes the TCP connection (or reuses it with
-careful framing). The C client and payload format need not change.
-
-A transparent AT-command firmware setup is less attractive: it adds AT command
-state handling and may not reliably provide the exact request/response bridge
-behavior needed by this DOS client. A small custom firmware is more predictable.
-
-The ESP-01's UART0 uses GPIO1/TX and GPIO3/RX. Its boot ROM can emit startup
-text at a different baud rate before application firmware starts; the client
-should tolerate and ignore non-protocol lines before the first #DASHBOARD line.
-Use the ESP in normal flash boot mode and ensure GPIO0/GPIO2/CH_PD/RESET have
-appropriate boot-state levels. The ESP8266 requires a stable supply capable of
-handling Wi-Fi transmit current bursts; level shifting is assumed handled by
-the project owner as specified.
-
-ESP TCP connection settings should include the Linux host's LAN IP address,
-TCP port 8765, Wi-Fi SSID/password, and bounded connection/read timeouts. On a
-failed TCP connection, the ESP should return a short diagnostic line or simply
-wait for the DOS client's timeout; it must not send fake dashboard records.
-Avoid emitting diagnostics on the UART while a dashboard response is in flight.
-
-LIMITATIONS / VERIFICATION
---------------------------
-- Python syntax compilation and mocked data-source tests passed during revision.
-- Borland C compilation and physical serial tests have not been performed here.
-- Third-party API formats/availability can change.
-- TCP port 8765 is unauthenticated; firewall it to the local trusted LAN.
-- The ESP bridge firmware itself is not included in this source bundle; the
-  existing Pocket386 serial protocol is deliberately preserved for it.
+ESP-AT NOTES
+------------
+Transparent mode is stateful. The client sends the AT setup commands on launch,
+then leaves transparent mode with the documented +++ escape sequence on normal
+quit. If the application or Pocket386 is reset unexpectedly while transparent
+mode is active, the ESP may remain in data mode; power-cycle the ESP-01S before
+relaunching if the client cannot get an AT response. Exact AT responses and
+recovery behavior depend on the installed factory firmware version.
