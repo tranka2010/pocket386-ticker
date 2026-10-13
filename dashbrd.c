@@ -3,19 +3,26 @@
 #include <string.h>
 #include <dos.h>
 #include <conio.h>
+#include <io.h>
+#include <fcntl.h>
 #include "screen.h"
 
 #define COM1_BASE 0x3F8
 #define BIOS_TICKS_PER_DAY 0x1800B0UL
 
+/* Edit these settings for direct TCP via the mTCP NC.EXE utility. */
+#define TCP_HOST_IP       "TCP_HOST_IP"
+#define TCP_HOST_PORT     8765
+
 /* Edit these four settings before building the ESP-AT transport. */
-#define ESP_WIFI_SSID     "YOUR_WIFI_NAME"
-#define ESP_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
-#define ESP_HOST_IP       "192.168.1.100"
+#define ESP_WIFI_SSID     "ESP_WIFI_SSID"
+#define ESP_WIFI_PASSWORD "ESP_WIFI_PASSWORD"
+#define ESP_HOST_IP       "ESP_HOST_IP"
 #define ESP_HOST_PORT     8765
 
 #define TRANSPORT_SERIAL 0
 #define TRANSPORT_ESP_AT 1
+#define TRANSPORT_TCP    2
 
 static int g_transport = TRANSPORT_SERIAL;
 static int g_esp_transparent_active = 0;
@@ -227,9 +234,11 @@ static void draw_dashboard_layout(void)
     header = MAKE_ATTR(BLACK, YELLOW);
     clear_screen(MAKE_ATTR(BLACK, LIGHTGRAY));
     if (g_transport == TRANSPORT_ESP_AT)
-        print_str(2, 0, "POCKET386 MS-DOS DASHBOARD [ESP-AT]", MAKE_ATTR(BLUE, WHITE));
+        print_str(2, 0, "POCKET386 DASHBOARD [WIFI]", MAKE_ATTR(BLUE, WHITE));
+    else if (g_transport == TRANSPORT_TCP)
+        print_str(2, 0, "POCKET386 DASHBOARD [TCP]", MAKE_ATTR(BLUE, WHITE));
     else
-        print_str(2, 0, "POCKET386 MS-DOS DASHBOARD [SERIAL]", MAKE_ATTR(BLUE, WHITE));
+        print_str(2, 0, "POCKET386 DASHBOARD [SERIAL]", MAKE_ATTR(BLUE, WHITE));
     draw_box(0,  1, 39, 8,  "1. WEATHER (Waltham, MA)", border, header);
     draw_box(40, 1, 79, 8,  "2. STOCKS & INDEXES", border, header);
     draw_box(0,  8, 39, 22, "3. HEADLINES (NPR / RSS)", border, header);
@@ -323,7 +332,7 @@ static void parse_and_render_line(char *line)
         parse_field(line, 3, f3, sizeof(f3));
         parse_field(line, 4, f4, sizeof(f4));
         f3[15] = '\0';
-        f4[15] = '\0';
+		f4[15] = '\0';
         print_str(2, 3, field, text_attr);
         print_str(2, 4, f2, MAKE_ATTR(BLACK, YELLOW));
         sprintf(f5, "%s  %s", f3, f4);
@@ -381,11 +390,90 @@ static void parse_and_render_line(char *line)
     }
 }
 
+static int fetch_tcp_data(void)
+{
+    char command[200];
+    char line_buf[512];
+    FILE *fp;
+    int got_end, system_rc;
+
+    print_str(1, 23, "[TCP/mTCP updating...]              ", MAKE_ATTR(BLACK, YELLOW));
+
+    /* mTCP's NC utility owns the TCP socket. Redirect its payload to a file so
+       Borland C 3.0 does not need to link against a different mTCP toolchain. */
+    fp = fopen("DASHGET.TXT", "wt");
+    if (!fp) {
+        print_str(1, 23, "[Cannot create DASHGET.TXT]          ", MAKE_ATTR(BLACK, LIGHTRED));
+        return 0;
+    }
+    fputs("GET\n", fp);
+    fclose(fp);
+    remove("DASHRSP.TXT");
+
+    /* -w allows the response to arrive after stdin reaches EOF. Avoid 2> NUL:
+       some DOS command interpreters do not support stderr redirection and NC
+       can then misread the 2 as an unknown option. */
+    sprintf(command,"C:\\MTCP\\NC -target %s %u -w 3 < DASHGET.TXT > DASHRSP.TXT",
+            TCP_HOST_IP, TCP_HOST_PORT);
+    /* Replace system(command) with this */
+    {
+        int saved_stderr;
+        int nul_handle;
+
+        fflush(stderr);
+        saved_stderr = dup(2);
+        nul_handle = open("NUL", O_WRONLY);
+
+        if (saved_stderr != -1 && nul_handle != -1) {
+            dup2(nul_handle, 2);
+            close(nul_handle);
+
+            system_rc = system(command);
+
+            fflush(stderr);
+            dup2(saved_stderr, 2);
+            close(saved_stderr);
+        } else {
+            if (nul_handle != -1)
+                close(nul_handle);
+            if (saved_stderr != -1)
+                close(saved_stderr);
+
+            system_rc = system(command);
+        }
+    }
+    (void)system_rc; /* NC's exit code varies by mTCP release; @END is decisive. */
+    fp = fopen("DASHRSP.TXT", "rt");
+    if (!fp) {
+        print_str(1, 23, "[TCP failed: no response file]       ", MAKE_ATTR(BLACK, LIGHTRED));
+        return 0;
+    }
+    got_end = 0;
+    while (fgets(line_buf, sizeof(line_buf), fp) != NULL) {
+        size_t len;
+        len = strlen(line_buf);
+        while (len > 0 && (line_buf[len - 1] == '\r' || line_buf[len - 1] == '\n'))
+            line_buf[--len] = '\0';
+        if (strncmp(line_buf, "@END", 4) == 0) { got_end = 1; break; }
+        if (line_buf[0]) parse_and_render_line(line_buf);
+    }
+    fclose(fp);
+    if (!got_end) {
+        print_str(1, 23, "[TCP incomplete; check server/NC]    ", MAKE_ATTR(BLACK, LIGHTRED));
+        return 0;
+    }
+    print_str(1, 23, "[Online TCP/mTCP] [F5] Refresh [Q] Quit", MAKE_ATTR(BLACK, WHITE));
+    return 1;
+}
+
 static int fetch_data_from_proxy(void)
 {
     char line_buf[512];
     unsigned long start;
     int got_end, status;
+
+    if (g_transport == TRANSPORT_TCP) return fetch_tcp_data();
+
     print_str(1, 23, "[Updating...]                        ", MAKE_ATTR(BLACK, YELLOW));
     if (!send_serial_str("GET\n")) {
         print_str(1, 23, "[Serial TX timeout] Press F5 to retry", MAKE_ATTR(BLACK, LIGHTRED));
@@ -420,15 +508,17 @@ int main(int argc, char *argv[])
     unsigned long refresh_interval_ticks;
     int i;
 
-    refresh_interval_ticks = 273UL; /* Approximately 15 seconds at 18.2 Hz. */
+    refresh_interval_ticks = 546UL; /* Approximately 30 seconds at 18.2 Hz. */
     g_transport = TRANSPORT_SERIAL; /* Backward-compatible default. */
     for (i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "/ESP") == 0 || strcmp(argv[i], "-ESP") == 0)
+        if (strcmp(argv[i], "/ESP") == 0 || strcmp(argv[i], "/esp") == 0 || strcmp(argv[i], "-ESP") == 0 || strcmp(argv[i], "-esp") == 0)
             g_transport = TRANSPORT_ESP_AT;
-        else if (strcmp(argv[i], "/SERIAL") == 0 || strcmp(argv[i], "-SERIAL") == 0)
+        else if (strcmp(argv[i], "/SERIAL") == 0 || strcmp(argv[i], "/serial") == 0 || strcmp(argv[i], "-SERIAL") == 0 || strcmp(argv[i], "-serial") == 0)
             g_transport = TRANSPORT_SERIAL;
+        else if (strcmp(argv[i], "/TCP") == 0 || strcmp(argv[i], "/tcp") == 0 || strcmp(argv[i], "-TCP") == 0 || strcmp(argv[i], "-tcp") == 0)
+            g_transport = TRANSPORT_TCP;
         else {
-            printf("Usage: DASHBRD [/SERIAL|/ESP]\n");
+            printf("Usage: DASHBRD [/SERIAL|/ESP|/TCP|/serial|/esp|/tcp]\n");
             return 1;
         }
     }
